@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <errno.h>
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -475,7 +476,7 @@ void k2_layout_report(void)
     printf("K2_LAYOUT_REPORT type_source=%s layout_source=%s"
            " key_type_user=%#" PRIx64 " default_domain_tag=%#" PRIx64
            " fake_slot=%u desc_off=%u freeptr=%u slab=[%#" PRIx64 ",%#" PRIx64
-           ")\n", k2l.type_source, k2l.layout_source, k2l.key_type_user,
+           "]\n", k2l.type_source, k2l.layout_source, k2l.key_type_user,
            k2l.default_domain_tag, k2l.fake_slot, k2l.desc_off, k2l.freeptr,
            k2l.slab_lo, k2l.slab_hi);
 }
