@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <linux/keyctl.h>
 #include <linux/membarrier.h>
 #include <stdbool.h>
